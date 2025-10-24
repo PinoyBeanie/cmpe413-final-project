@@ -3,7 +3,7 @@
 -- Entity: cache_fsm
 -- Architecture: structural
 -- Purpose   : Structural FSM controller for the UMBC cache project
--- Author    : ChatGPT (based on project spec)
+-- Author    : Lance Boac
 -- Date      : 2025-10-24
 -- ============================================================================
 
