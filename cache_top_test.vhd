@@ -1,12 +1,17 @@
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
+use IEEE.std_logic_textio.all;
+use STD.textio.all;
 
-entity tb_cache_top is
+entity cache_top_test is
 end entity;
 
-architecture sim of tb_cache_top is
-  -- DUT
+architecture tb of cache_top_test is
+
+  --------------------------------------------------------------------------
+  -- DUT Declaration
+  --------------------------------------------------------------------------
   component cache_top
     port (
       clk, reset  : in  std_logic;
@@ -22,25 +27,31 @@ architecture sim of tb_cache_top is
     );
   end component;
 
-  -- DUT signals
-  signal clk, reset  : std_logic := '0';
-  signal start, rd_wr: std_logic := '0';
-  signal CA          : std_logic_vector(5 downto 0) := (others => '0');
-  signal CD_in       : std_logic_vector(7 downto 0) := (others => '0');
-  signal CD_out      : std_logic_vector(7 downto 0);
-  signal busy        : std_logic;
-  signal MA          : std_logic_vector(5 downto 0);
-  signal MD          : std_logic_vector(7 downto 0);
-  signal mem_enable  : std_logic;
+  --------------------------------------------------------------------------
+  -- Signals
+  --------------------------------------------------------------------------
+  signal clk, reset, start, rd_wr : std_logic := '0';
+  signal CA, MA : std_logic_vector(5 downto 0) := (others => '0');
+  signal CD_in, CD_out, MD : std_logic_vector(7 downto 0) := (others => '0');
+  signal busy, mem_enable : std_logic;
 
-  -- Memory model signals
-  signal mem_data    : std_logic_vector(7 downto 0);
-  signal mem_ctr     : integer := 0;
+  -- File output
+  file results : text open write_mode is "sim_output.txt";
+
+  -- Hex print helper
+  procedure PHEX(constant label_str : in string; signal v : in std_logic_vector) is
+    variable L : line;
+  begin
+    write(L, label_str);
+    hwrite(L, v);
+    writeline(output, L);
+    writeline(results, L);
+  end procedure;
+
 begin
-  -- Clock generation: 10 ns period
-  clk <= not clk after 5 ns;
-
-  -- Instantiate DUT
+  --------------------------------------------------------------------------
+  -- DUT Instance
+  --------------------------------------------------------------------------
   uut: cache_top
     port map (
       clk => clk,
@@ -56,59 +67,89 @@ begin
       mem_enable => mem_enable
     );
 
-  -- Simple memory model: return bytes 0x10, 0x11, 0x12, 0x13 spaced 2 cycles apart
-  process(clk)
-  begin
-    if falling_edge(clk) then
-      if mem_enable = '1' then
-        mem_ctr <= 0;
-      elsif mem_ctr < 20 then
-        mem_ctr <= mem_ctr + 1;
-      end if;
-    end if;
-  end process;
-
-  MD <= x"10" when mem_ctr = 8 else
-         x"11" when mem_ctr = 10 else
-         x"12" when mem_ctr = 12 else
-         x"13" when mem_ctr = 14 else
-         (others => '0');
+  --------------------------------------------------------------------------
+  -- 20 ns Clock
+  --------------------------------------------------------------------------
+  clk <= not clk after 10 ns;
 
   --------------------------------------------------------------------------
-  -- Test sequence
+  -- Stimulus
   --------------------------------------------------------------------------
-  stim: process
+  stim_proc : process
+    variable L : line;
   begin
-    -- RESET
+    ------------------------------------------------------------------------
+    -- 1. RESET
+    ------------------------------------------------------------------------
+    write(L, string'("=== RESET PHASE ===")); writeline(output, L);
     reset <= '1';
-    wait for 20 ns;
+    wait for 40 ns;
     reset <= '0';
-    wait for 20 ns;
-
-    -- 1. READ MISS (0x00)
-    CA <= "000000"; rd_wr <= '1'; start <= '1';
-    wait for 10 ns; start <= '0';
-    wait until busy = '0';
     wait for 40 ns;
 
-    -- 2. WRITE HIT (0x03)
-    CA <= "000011"; rd_wr <= '0'; CD_in <= x"FF"; start <= '1';
-    wait for 10 ns; start <= '0';
-    wait until busy = '0';
-    wait for 40 ns;
+    ------------------------------------------------------------------------
+    -- 2. READ MISS (Address 0x00)
+    ------------------------------------------------------------------------
+    write(L, string'("=== READ MISS TEST ===")); writeline(output, L);
+    rd_wr <= '1';                 -- READ
+    CA <= "000000";               -- 0x00
+    start <= '1'; wait for 20 ns; start <= '0';
+    wait until mem_enable = '1';
+    write(L, string'("Memory access detected for READ MISS at ")); 
+    write(L, time'image(now)); writeline(output, L);
 
-    -- 3. READ HIT (0x03)
-    CA <= "000011"; rd_wr <= '1'; start <= '1';
-    wait for 10 ns; start <= '0';
-    wait until busy = '0';
-    wait for 40 ns;
+    -- Memory sends 4 bytes: 00, 01, 02, 03
+    wait for 160 ns; MD <= x"00";
+    wait for 40 ns;  MD <= x"01";
+    wait for 40 ns;  MD <= x"02";
+    wait for 40 ns;  MD <= x"03";
 
-    -- 4. WRITE MISS (0x3F)
-    CA <= "111111"; rd_wr <= '0'; CD_in <= x"AA"; start <= '1';
-    wait for 10 ns; start <= '0';
     wait until busy = '0';
+    write(L, string'("READ MISS complete at ")); write(L, time'image(now)); writeline(output, L);
+    PHEX("CD_out=0x", CD_out);
 
+    ------------------------------------------------------------------------
+    -- 3. WRITE HIT (Address 0x03, Data 0xFF)
+    ------------------------------------------------------------------------
     wait for 100 ns;
-    assert false report "Simulation finished successfully" severity failure;
+    write(L, string'("=== WRITE HIT TEST ===")); writeline(output, L);
+    rd_wr <= '0';                 -- WRITE
+    CA <= "000011";               -- 0x03
+    CD_in <= x"FF";
+    start <= '1'; wait for 20 ns; start <= '0';
+    wait until busy = '0';
+    write(L, string'("WRITE HIT complete at ")); write(L, time'image(now)); writeline(output, L);
+
+    ------------------------------------------------------------------------
+    -- 4. READ HIT (Address 0x03)
+    ------------------------------------------------------------------------
+    wait for 100 ns;
+    write(L, string'("=== READ HIT TEST ===")); writeline(output, L);
+    rd_wr <= '1';                 -- READ
+    CA <= "000011";               -- same address (hit)
+    start <= '1'; wait for 20 ns; start <= '0';
+    wait until busy = '0';
+    write(L, string'("READ HIT complete at ")); write(L, time'image(now)); writeline(output, L);
+    PHEX("CD_out=0x", CD_out);
+
+    ------------------------------------------------------------------------
+    -- 5. WRITE MISS (Address 0x3F, Data 0xAA)
+    ------------------------------------------------------------------------
+    wait for 100 ns;
+    write(L, string'("=== WRITE MISS TEST ===")); writeline(output, L);
+    rd_wr <= '0';                 -- WRITE
+    CA <= "111111";               -- 0x3F (miss)
+    CD_in <= x"AA";
+    start <= '1'; wait for 20 ns; start <= '0';
+    wait until busy = '0';
+    write(L, string'("WRITE MISS complete at ")); write(L, time'image(now)); writeline(output, L);
+    PHEX("CD_out=0x", CD_out);
+
+    ------------------------------------------------------------------------
+    -- DONE
+    ------------------------------------------------------------------------
+    wait for 200 ns;
+    assert false report "Simulation completed successfully." severity failure;
   end process;
+
 end architecture;
