@@ -9,9 +9,6 @@ end entity;
 
 architecture tb of cache_top_test is
 
-  --------------------------------------------------------------------------
-  -- DUT Declaration
-  --------------------------------------------------------------------------
   component cache_top
     port (
       clk, reset  : in  std_logic;
@@ -27,9 +24,7 @@ architecture tb of cache_top_test is
     );
   end component;
 
-  --------------------------------------------------------------------------
   -- Signals
-  --------------------------------------------------------------------------
   signal clk, reset, start, rd_wr : std_logic := '0';
   signal CA, MA : std_logic_vector(5 downto 0) := (others => '0');
   signal CD_in, CD_out, MD : std_logic_vector(7 downto 0) := (others => '0');
@@ -38,7 +33,6 @@ architecture tb of cache_top_test is
   -- File output
   file results : text open write_mode is "sim_output.txt";
 
-  -- Hex print helper
   procedure PHEX(constant label_str : in string; signal v : in std_logic_vector) is
     variable L : line;
   begin
@@ -49,9 +43,14 @@ architecture tb of cache_top_test is
   end procedure;
 
 begin
-  --------------------------------------------------------------------------
+  --------------------------------------------------------------------
+  -- 20 ns Clock
+  --------------------------------------------------------------------
+  clk <= not clk after 10 ns;
+
+  --------------------------------------------------------------------
   -- DUT Instance
-  --------------------------------------------------------------------------
+  --------------------------------------------------------------------
   uut: cache_top
     port map (
       clk => clk,
@@ -67,87 +66,80 @@ begin
       mem_enable => mem_enable
     );
 
-  --------------------------------------------------------------------------
-  -- 20 ns Clock
-  --------------------------------------------------------------------------
-  clk <= not clk after 10 ns;
-
-  --------------------------------------------------------------------------
+  --------------------------------------------------------------------
   -- Stimulus
-  --------------------------------------------------------------------------
+  --------------------------------------------------------------------
   stim_proc : process
     variable L : line;
   begin
-    ------------------------------------------------------------------------
-    -- 1. RESET
-    ------------------------------------------------------------------------
+    ----------------------------------------------------------------
+    -- RESET
+    ----------------------------------------------------------------
     write(L, string'("=== RESET PHASE ===")); writeline(output, L);
     reset <= '1';
     wait for 40 ns;
     reset <= '0';
-    wait for 40 ns;
+    wait for 60 ns;
 
-    ------------------------------------------------------------------------
-    -- 2. READ MISS (Address 0x00)
-    ------------------------------------------------------------------------
+    ----------------------------------------------------------------
+    -- 1. READ MISS
+    ----------------------------------------------------------------
     write(L, string'("=== READ MISS TEST ===")); writeline(output, L);
-    rd_wr <= '1';                 -- READ
-    CA <= "000000";               -- 0x00
+    rd_wr <= '1'; CA <= "000000";
     start <= '1'; wait for 20 ns; start <= '0';
     wait until mem_enable = '1';
-    write(L, string'("Memory access detected for READ MISS at ")); 
-    write(L, time'image(now)); writeline(output, L);
+    write(L, string'("Memory access for READ MISS triggered")); writeline(output, L);
 
-    -- Memory sends 4 bytes: 00, 01, 02, 03
-    wait for 160 ns; MD <= x"00";
-    wait for 40 ns;  MD <= x"01";
-    wait for 40 ns;  MD <= x"02";
-    wait for 40 ns;  MD <= x"03";
+    wait for 100 ns; MD <= x"10";
+    wait for 40 ns;  MD <= x"11";
+    wait for 40 ns;  MD <= x"12";
+    wait for 40 ns;  MD <= x"13";
 
+     wait for 10 ns; -- allow busy to settle
     wait until busy = '0';
-    write(L, string'("READ MISS complete at ")); write(L, time'image(now)); writeline(output, L);
-    PHEX("CD_out=0x", CD_out);
+    PHEX("READ MISS result CD_out=0x", CD_out);
 
-    ------------------------------------------------------------------------
-    -- 3. WRITE HIT (Address 0x03, Data 0xFF)
-    ------------------------------------------------------------------------
-    wait for 100 ns;
-    write(L, string'("=== WRITE HIT TEST ===")); writeline(output, L);
-    rd_wr <= '0';                 -- WRITE
-    CA <= "000011";               -- 0x03
-    CD_in <= x"FF";
-    start <= '1'; wait for 20 ns; start <= '0';
-    wait until busy = '0';
-    write(L, string'("WRITE HIT complete at ")); write(L, time'image(now)); writeline(output, L);
-
-    ------------------------------------------------------------------------
-    -- 4. READ HIT (Address 0x03)
-    ------------------------------------------------------------------------
+    ----------------------------------------------------------------
+    -- 2. READ HIT
+    ----------------------------------------------------------------
     wait for 100 ns;
     write(L, string'("=== READ HIT TEST ===")); writeline(output, L);
-    rd_wr <= '1';                 -- READ
-    CA <= "000011";               -- same address (hit)
+    rd_wr <= '1'; CA <= "000000";
     start <= '1'; wait for 20 ns; start <= '0';
-    wait until busy = '0';
-    write(L, string'("READ HIT complete at ")); write(L, time'image(now)); writeline(output, L);
-    PHEX("CD_out=0x", CD_out);
 
-    ------------------------------------------------------------------------
-    -- 5. WRITE MISS (Address 0x3F, Data 0xAA)
-    ------------------------------------------------------------------------
+     wait for 10 ns; -- allow busy to settle
+    wait until busy = '0';
+    PHEX("READ HIT result CD_out=0x", CD_out);
+
+    ----------------------------------------------------------------
+    -- 3. WRITE MISS
+    ----------------------------------------------------------------
     wait for 100 ns;
     write(L, string'("=== WRITE MISS TEST ===")); writeline(output, L);
-    rd_wr <= '0';                 -- WRITE
-    CA <= "111111";               -- 0x3F (miss)
-    CD_in <= x"AA";
+    rd_wr <= '0'; CA <= "111100"; CD_in <= x"AA";
     start <= '1'; wait for 20 ns; start <= '0';
-    wait until busy = '0';
-    write(L, string'("WRITE MISS complete at ")); write(L, time'image(now)); writeline(output, L);
-    PHEX("CD_out=0x", CD_out);
+    wait until mem_enable = '1';
+    write(L, string'("WRITE MISS memory enable asserted")); writeline(output, L);
 
-    ------------------------------------------------------------------------
+     wait for 10 ns; -- allow busy to settle
+    wait until busy = '0';
+    PHEX("WRITE MISS complete CD_out=0x", CD_out);
+
+    ----------------------------------------------------------------
+    -- 4. WRITE HIT
+    ----------------------------------------------------------------
+    wait for 100 ns;
+    write(L, string'("=== WRITE HIT TEST ===")); writeline(output, L);
+    rd_wr <= '0'; CA <= "111100"; CD_in <= x"BB";
+    start <= '1'; wait for 20 ns; start <= '0';
+
+    wait for 10 ns; -- allow busy to settle
+    wait until busy = '0';
+    PHEX("WRITE HIT complete CD_out=0x", CD_out);
+
+    ----------------------------------------------------------------
     -- DONE
-    ------------------------------------------------------------------------
+    ----------------------------------------------------------------
     wait for 200 ns;
     assert false report "Simulation completed successfully." severity failure;
   end process;
