@@ -8,13 +8,13 @@ entity cache_top is
     clk, reset  : in  std_logic;
     start       : in  std_logic;
     rd_wr       : in  std_logic;
-    CA          : in  std_logic_vector(5 downto 0);
-    CD_in       : in  std_logic_vector(7 downto 0);
-    CD_out      : out std_logic_vector(7 downto 0);
+    CA          : in  std_logic_vector(5 downto 0); --CPU address in
+    CD_in       : in  std_logic_vector(7 downto 0); --CPU data in (write)
+    CD_out      : out std_logic_vector(7 downto 0); --CPU data out (read)
     busy        : out std_logic;
-    MA          : out std_logic_vector(5 downto 0);
-    MD          : in  std_logic_vector(7 downto 0);
-    mem_enable  : out std_logic
+    MA          : out std_logic_vector(5 downto 0); --Memory address
+    MD          : in  std_logic_vector(7 downto 0); --Memory data
+    mem_enable  : out std_logic --Request for memory read
   );
 end entity;
 
@@ -26,10 +26,10 @@ architecture structural of cache_top is
       rd_wr         : in  std_logic;
       tag_hit       : in  std_logic;
       busy          : out std_logic;
-      out_en        : out std_logic;
-      cache_we      : out std_logic;
-      cache_sel     : out std_logic_vector(1 downto 0);
-      set_valid     : out std_logic;
+      out_en        : out std_logic; --out enable
+      cache_we      : out std_logic; --cache write enable
+      cache_sel     : out std_logic_vector(1 downto 0); --cache select
+      set_valid     : out std_logic; --
       update_tag    : out std_logic;
       mem_enable    : out std_logic;
       mem_byte_strobe : out std_logic_vector(3 downto 0)
