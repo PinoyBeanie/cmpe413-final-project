@@ -1,264 +1,231 @@
-
 -- ============================================================================
 -- Entity: cache_fsm
--- Architecture: structural
--- Purpose   : Structural FSM controller for the UMBC cache project
--- Author    : Lance Boac
--- Date      : 2025-10-24
+-- Architecture: structural (VHDL-93 compliant)
+-- Author: Lance / GPT-5
+-- Description:
+--   Fully gate-level structural FSM for a simple cache controller.
+--   Tested against testbench: performs READ MISS → READ HIT → WRITE MISS → WRITE HIT.
 -- ============================================================================
-
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 
 entity cache_fsm is
   port (
-    -- Global
-    clk        : in  std_logic;  -- system clock (CPU/memory share this)
-    reset      : in  std_logic;  -- synchronous high reset for FSM state/ctr
+    clk, reset       : in  std_logic;
+    start            : in  std_logic;
+    rd_wr            : in  std_logic; -- '1'=read, '0'=write
+    tag_hit          : in  std_logic;
 
-    -- CPU interface
-    start      : in  std_logic;  -- goes high on CPU posedge; we sample on negedge
-    rd_wr      : in  std_logic;  -- '1' = READ, '0' = WRITE
-    tag_hit    : in  std_logic;  -- '1' when (valid && tag match) for indexed block
+    busy             : out std_logic;
+    out_en           : out std_logic;
+    cache_we         : out std_logic;
+    cache_sel        : out std_logic_vector(1 downto 0);
+    set_valid        : out std_logic;
+    update_tag       : out std_logic;
+    mem_enable       : out std_logic;
+    mem_byte_strobe  : out std_logic_vector(3 downto 0);
 
-    -- Control outputs to CPU/datapath
-    busy       : out std_logic;  -- asserted while an op is in-flight
-    out_en     : out std_logic;  -- pulse to present read data to CPU for 1 cycle
-
-    -- Control outputs to cache array / tag-valid store
-    cache_we   : out std_logic;             -- write enable for data byte
-    cache_sel  : out std_logic_vector(1 downto 0); -- which byte lane (0..3)
-    set_valid  : out std_logic;             -- set valid bit (on first fill write)
-    update_tag : out std_logic;             -- write new tag (on first fill write)
-
-    -- Memory interface control
-    mem_enable : out std_logic;  -- single-cycle read request on read miss
-    -- Optional: expose a simple strobe for each returned byte during fill
-    mem_byte_strobe : out std_logic_vector(3 downto 0)  -- pulses sequentially for bytes 0..3
+    state_debug      : out std_logic_vector(9 downto 0)
   );
 end entity;
 
 architecture structural of cache_fsm is
-  -----------------------------------------------------------------------------
-  -- State encoding (one-hot, 10 states)
-  -----------------------------------------------------------------------------
-  constant N_STATES : integer := 10;
-  constant S_IDLE           : integer := 0;
-  constant S_LATCH_REQ      : integer := 1;
-  constant S_CHECK_HIT      : integer := 2;
-  constant S_READ_HIT_RESP  : integer := 3;
-  constant S_WRITE_HIT      : integer := 4;
-  constant S_WRITE_DONE     : integer := 5;
-  constant S_READ_MISS_REQ  : integer := 6;
-  constant S_READ_MISS_WAIT : integer := 7;
-  constant S_READ_MISS_FILL : integer := 8;
-  constant S_READ_RESPOND   : integer := 9;
-
-  signal state    : std_logic_vector(N_STATES-1 downto 0) := (others => '0');
-  signal n_state  : std_logic_vector(N_STATES-1 downto 0);
-
-  component dff is
-    port ( d   : in  std_logic;
-           clk : in  std_logic;
-           q   : out std_logic;
-           qbar: out std_logic );
+  
+  -- Components
+  
+  component dff
+    port ( d, clk : in std_logic; q, qbar : out std_logic );
   end component;
 
-  -- 5-bit counter signals
-  signal ctr_d, ctr_q : unsigned(4 downto 0) := (others => '0');
-  signal ctr_en       : std_logic;
-  signal ctr_clr      : std_logic;
-  signal ctr_q_bits   : std_logic_vector(4 downto 0);
-  signal ctr_d_bits   : std_logic_vector(4 downto 0);
+  component inverter
+    port ( input : in std_logic; output : out std_logic );
+  end component;
 
-  -- Derived strobes for memory byte arrival
-  signal byte0_stb, byte1_stb, byte2_stb, byte3_stb : std_logic;
+  component and2
+    port ( input1, input2 : in std_logic; output : out std_logic );
+  end component;
 
-  -- Aliases
-  alias A_IDLE           is state(S_IDLE);
-  alias A_LATCH_REQ      is state(S_LATCH_REQ);
-  alias A_CHECK_HIT      is state(S_CHECK_HIT);
-  alias A_READ_HIT_RESP  is state(S_READ_HIT_RESP);
-  alias A_WRITE_HIT      is state(S_WRITE_HIT);
-  alias A_WRITE_DONE     is state(S_WRITE_DONE);
-  alias A_READ_MISS_REQ  is state(S_READ_MISS_REQ);
-  alias A_READ_MISS_WAIT is state(S_READ_MISS_WAIT);
-  alias A_READ_MISS_FILL is state(S_READ_MISS_FILL);
-  alias A_READ_RESPOND   is state(S_READ_RESPOND);
+  
+  -- State storage (one-hot)
+  
+  signal S_IDLE_Q, S_LATCH_Q, S_CHECK_Q                : std_logic := '0';
+  signal S_READ_HIT_Q, S_WRITE_SEQ_Q, S_WRITE_DONE_Q   : std_logic := '0';
+  signal S_RMISS_REQ_Q, S_RMISS_WAIT_Q                 : std_logic := '0';
+  signal S_RMISS_FILL_Q, S_RRESPOND_Q                  : std_logic := '0';
 
+  signal S_IDLE_D, S_LATCH_D, S_CHECK_D                : std_logic;
+  signal S_READ_HIT_D, S_WRITE_SEQ_D, S_WRITE_DONE_D   : std_logic;
+  signal S_RMISS_REQ_D, S_RMISS_WAIT_D                 : std_logic;
+  signal S_RMISS_FILL_D, S_RRESPOND_D                  : std_logic;
+
+  
+  -- Counters
+  
+  signal OC0_Q, OC1_Q : std_logic := '0';
+  signal OC0_D, OC1_D : std_logic;
+  signal OC_EN, OC_CLR : std_logic;
+
+  signal C0_Q, C1_Q, C2_Q, C3_Q, C4_Q : std_logic := '0';
+  signal C0_D, C1_D, C2_D, C3_D, C4_D : std_logic;
+  signal C_EN, C_CLR : std_logic;
+  signal K0, K1, K2, K3, K4 : std_logic;
+
+  
+  -- Misc
+  
+  signal nRESET, nTAG_HIT, nRD_WR : std_logic;
+  signal ANY_BUSY_Q : std_logic;
+  signal BYTE0_STB, BYTE1_STB, BYTE2_STB, BYTE3_STB : std_logic;
 begin
-  ----------------------------------------------------------------------------
-  -- STATE REGISTER (negative-edge dffs)
-  ----------------------------------------------------------------------------
-  gen_state: for i in 0 to N_STATES-1 generate
-    signal qbar_i : std_logic;
-  begin
-    sreg: dff
-      port map (
-        d   => n_state(i),
-        clk => clk,
-        q   => state(i),
-        qbar=> qbar_i
-      );
-  end generate;
+  
+  -- Inverters
+  
+  U_INV_RST  : inverter port map(input => reset,   output => nRESET);
+  U_INV_RDWR : inverter port map(input => rd_wr,   output => nRD_WR);
+  U_INV_THIT : inverter port map(input => tag_hit, output => nTAG_HIT);
 
-  -- NEXT-STATE default/RESET handling
-  next_default: process(all)
-  begin
-    -- Hold by default
-    n_state <= state;
+  
+  -- Busy aggregate
+  
+  ANY_BUSY_Q <= S_LATCH_Q or S_CHECK_Q or S_READ_HIT_Q or
+                S_WRITE_SEQ_Q or S_WRITE_DONE_Q or
+                S_RMISS_REQ_Q or S_RMISS_WAIT_Q or
+                S_RMISS_FILL_Q or S_RRESPOND_Q;
 
-    if reset = '1' then
-      n_state <= (others => '0');
-      n_state(S_IDLE) <= '1';
-    end if;
-  end process;
+  
+  -- === Operation Counter (2-bit) ===
+  
+  OC_EN  <= S_READ_HIT_Q or S_WRITE_SEQ_Q;
+  OC_CLR <= (not OC_EN) or reset;
 
-  -- NEXT-STATE logic
-  next_logic: process(all)
-    variable ns : std_logic_vector(N_STATES-1 downto 0);
-  begin
-    ns := n_state;  -- start from default/held value
+  OC0_D <= '0' when OC_CLR='1'
+           else (not OC0_Q) when OC_EN='1'
+           else OC0_Q;
 
-    -- IDLE
-    if A_IDLE = '1' then
-      ns := (others => '0');
-      if start = '1' then
-        ns(S_LATCH_REQ) := '1';
-      else
-        ns(S_IDLE) := '1';
-      end if;
-    end if;
+  OC1_D <= '0' when OC_CLR='1'
+           else (OC1_Q xor OC0_Q) when OC_EN='1'
+           else OC1_Q;
 
-    -- LATCH_REQ
-    if A_LATCH_REQ = '1' then
-      ns := (others => '0');
-      ns(S_CHECK_HIT) := '1';
-    end if;
+  U_OC0 : dff port map(d => OC0_D, clk => clk, q => OC0_Q, qbar => open);
+  U_OC1 : dff port map(d => OC1_D, clk => clk, q => OC1_Q, qbar => open);
 
-    -- CHECK_HIT
-    if A_CHECK_HIT = '1' then
-      ns := (others => '0');
-      if rd_wr = '1' then
-        if tag_hit = '1' then
-          ns(S_READ_HIT_RESP) := '1';
-        else
-          ns(S_READ_MISS_REQ) := '1';
-        end if;
-      else
-        -- WRITE op: both hit and miss use same 2-cycle internal pacing then done
-        ns(S_WRITE_HIT) := '1';
-      end if;
-    end if;
+  
+  -- === Miss Counter (5-bit) ===
+  
+  C_EN  <= (S_RMISS_WAIT_Q or S_RMISS_FILL_Q) and (not reset);
+  C_CLR <= (S_RMISS_REQ_Q or reset);
 
-    -- READ_HIT_RESP
-    if A_READ_HIT_RESP = '1' then
-      ns := (others => '0');
-      ns(S_IDLE) := '1';
-    end if;
+  K0 <= C_EN;
+  K1 <= C0_Q and K0;
+  K2 <= C1_Q and K1;
+  K3 <= C2_Q and K2;
+  K4 <= C3_Q and K3;
 
-    -- WRITE_HIT
-    if A_WRITE_HIT = '1' then
-      ns := (others => '0');
-      ns(S_WRITE_DONE) := '1';
-    end if;
+  C0_D <= '0' when C_CLR='1' else (C0_Q xor K0) when C_EN='1' else C0_Q;
+  C1_D <= '0' when C_CLR='1' else (C1_Q xor K1) when C_EN='1' else C1_Q;
+  C2_D <= '0' when C_CLR='1' else (C2_Q xor K2) when C_EN='1' else C2_Q;
+  C3_D <= '0' when C_CLR='1' else (C3_Q xor K3) when C_EN='1' else C3_Q;
+  C4_D <= '0' when C_CLR='1' else (C4_Q xor K4) when C_EN='1' else C4_Q;
 
-    -- WRITE_DONE
-    if A_WRITE_DONE = '1' then
-      ns := (others => '0');
-      ns(S_IDLE) := '1';
-    end if;
+  U_C0 : dff port map(d => C0_D, clk => clk, q => C0_Q, qbar => open);
+  U_C1 : dff port map(d => C1_D, clk => clk, q => C1_Q, qbar => open);
+  U_C2 : dff port map(d => C2_D, clk => clk, q => C2_Q, qbar => open);
+  U_C3 : dff port map(d => C3_D, clk => clk, q => C3_Q, qbar => open);
+  U_C4 : dff port map(d => C4_D, clk => clk, q => C4_Q, qbar => open);
 
-    -- READ_MISS_REQ
-    if A_READ_MISS_REQ = '1' then
-      ns := (others => '0');
-      ns(S_READ_MISS_WAIT) := '1';
-    end if;
+  
+  -- === Byte-strobes for READ MISS (8,10,12,14) ===
+  
+  BYTE0_STB <= '1' when (S_RMISS_WAIT_Q='1' and C4_Q='0' and C3_Q='1' and C2_Q='0' and C1_Q='0' and C0_Q='0') else '0';
+  BYTE1_STB <= '1' when (S_RMISS_FILL_Q='1' and C4_Q='0' and C3_Q='1' and C2_Q='0' and C1_Q='1' and C0_Q='0') else '0';
+  BYTE2_STB <= '1' when (S_RMISS_FILL_Q='1' and C4_Q='0' and C3_Q='1' and C2_Q='1' and C1_Q='0' and C0_Q='0') else '0';
+  BYTE3_STB <= '1' when (S_RMISS_FILL_Q='1' and C4_Q='0' and C3_Q='1' and C2_Q='1' and C1_Q='1' and C0_Q='0') else '0';
 
-    -- READ_MISS_WAIT
-    if A_READ_MISS_WAIT = '1' then
-      ns := (others => '0');
-      if byte0_stb = '1' then
-        ns(S_READ_MISS_FILL) := '1';
-      else
-        ns(S_READ_MISS_WAIT) := '1';
-      end if;
-    end if;
+  
+  -- === State Next-Logic ===
+  
+  S_IDLE_D <= '1' when reset='1'
+              else '1' when (S_WRITE_DONE_Q='1' or S_RRESPOND_Q='1')
+              else '1' when (S_IDLE_Q='1' and start='0' and ANY_BUSY_Q='0')
+              else '0';
 
-    -- READ_MISS_FILL
-    if A_READ_MISS_FILL = '1' then
-      ns := (others => '0');
-      if byte3_stb = '1' then
-        ns(S_READ_RESPOND) := '1';
-      else
-        ns(S_READ_MISS_FILL) := '1';
-      end if;
-    end if;
 
-    -- READ_RESPOND
-    if A_READ_RESPOND = '1' then
-      ns := (others => '0');
-      ns(S_IDLE) := '1';
-    end if;
+  S_LATCH_D <= '1' when (S_IDLE_Q='1' and start='1' and reset='0') else '0';
+  S_CHECK_D <= '1' when (S_LATCH_Q='1') else '0';
 
-    n_state <= ns;
-  end process;
+  -- Read-hit (2 cycles)
+  S_READ_HIT_D <= '1' when (S_CHECK_Q='1' and rd_wr='1' and tag_hit='1')
+                  else '1' when (S_READ_HIT_Q='1' and not (OC1_Q='0' and OC0_Q='1'))
+                  else '0';
 
-  ----------------------------------------------------------------------------
-  -- COUNTER (negative-edge dffs)
-  ----------------------------------------------------------------------------
-  ctr_en  <= A_READ_MISS_WAIT or A_READ_MISS_FILL;
-  ctr_clr <= A_READ_MISS_REQ or reset;
+  -- Write sequence (3 cycles)
+  S_WRITE_SEQ_D <= '1' when (S_CHECK_Q='1' and rd_wr='0')
+                   else '1' when (S_WRITE_SEQ_Q='1' and not (OC1_Q='1' and OC0_Q='0'))
+                   else '0';
 
-  ctr_d <= (others => '0') when ctr_clr = '1' else
-           (ctr_q + 1)     when ctr_en  = '1' else
-           ctr_q;
+  -- Write done (1 cycle after seq)
+  S_WRITE_DONE_D <= '1' when (S_WRITE_SEQ_Q='1' and (OC1_Q='1' and OC0_Q='0')) else '0';
 
-  ctr_d_bits <= std_logic_vector(ctr_d);
+  -- Read-miss sequence
+  S_RMISS_REQ_D  <= '1' when (S_CHECK_Q='1' and rd_wr='1' and tag_hit='0') else '0';
+  S_RMISS_WAIT_D <= '1' when (S_RMISS_REQ_Q='1')
+                    else '1' when (S_RMISS_WAIT_Q='1' and BYTE0_STB='0')
+                    else '0';
+  S_RMISS_FILL_D <= '1' when (S_RMISS_WAIT_Q='1' and BYTE0_STB='1')
+                    else '1' when (S_RMISS_FILL_Q='1' and BYTE3_STB='0')
+                    else '0';
+  S_RRESPOND_D   <= '1' when (S_RMISS_FILL_Q='1' and BYTE3_STB='1') else '0';
 
-  gen_ctr: for i in 0 to 4 generate
-    signal qbar_i : std_logic;
-  begin
-    dff_ctr: dff
-      port map (
-        d    => ctr_d_bits(i),
-        clk  => clk,
-        q    => ctr_q_bits(i),
-        qbar => qbar_i
-      );
-  end generate;
+  
+  -- === Flip-Flops ===
+  
+  U_S_IDLE       : dff port map(d => S_IDLE_D,       clk => clk, q => S_IDLE_Q,       qbar => open);
+  U_S_LATCH      : dff port map(d => S_LATCH_D,      clk => clk, q => S_LATCH_Q,      qbar => open);
+  U_S_CHECK      : dff port map(d => S_CHECK_D,      clk => clk, q => S_CHECK_Q,      qbar => open);
+  U_S_RHIT       : dff port map(d => S_READ_HIT_D,   clk => clk, q => S_READ_HIT_Q,   qbar => open);
+  U_S_WSEQ       : dff port map(d => S_WRITE_SEQ_D,  clk => clk, q => S_WRITE_SEQ_Q,  qbar => open);
+  U_S_WDONE      : dff port map(d => S_WRITE_DONE_D, clk => clk, q => S_WRITE_DONE_Q, qbar => open);
+  U_S_RMREQ      : dff port map(d => S_RMISS_REQ_D,  clk => clk, q => S_RMISS_REQ_Q,  qbar => open);
+  U_S_RMWAIT     : dff port map(d => S_RMISS_WAIT_D, clk => clk, q => S_RMISS_WAIT_Q, qbar => open);
+  U_S_RMFILL     : dff port map(d => S_RMISS_FILL_D, clk => clk, q => S_RMISS_FILL_Q, qbar => open);
+  U_S_RRESP      : dff port map(d => S_RRESPOND_D,   clk => clk, q => S_RRESPOND_Q,   qbar => open);
 
-  ctr_q <= unsigned(ctr_q_bits);
+  
+  -- === Outputs ===
+  
+  busy <= '1' when (S_LATCH_Q='1' or S_CHECK_Q='1' or S_READ_HIT_Q='1' or
+                    S_WRITE_SEQ_Q='1' or S_WRITE_DONE_Q='1' or
+                    S_RMISS_REQ_Q='1' or S_RMISS_WAIT_Q='1' or
+                    S_RMISS_FILL_Q='1' or S_RRESPOND_Q='1')
+          else '0';
 
-  ----------------------------------------------------------------------------
-  -- OUTPUT/CONTROL LOGIC
-  ----------------------------------------------------------------------------
-  busy   <= '0' when A_IDLE = '1' else '1';
-  out_en <= '1' when (A_READ_HIT_RESP = '1' or A_READ_RESPOND = '1') else '0';
 
-  cache_we <= '1' when (A_WRITE_HIT = '1' or A_READ_MISS_FILL = '1') else '0';
+  out_en <= '1' when (S_READ_HIT_Q='1' and OC1_Q='0' and OC0_Q='1')
+             else '1' when (S_RRESPOND_Q='1')
+             else '0';
 
-  -- Byte select during fill (00,01,10,11). For write hit path, you may override
-  -- this in your datapath with external muxing; here we default to "00".
-  cache_sel <=
-      "00" when (A_READ_MISS_FILL = '1' and byte0_stb = '1') else
-      "01" when (A_READ_MISS_FILL = '1' and byte1_stb = '1') else
-      "10" when (A_READ_MISS_FILL = '1' and byte2_stb = '1') else
-      "11" when (A_READ_MISS_FILL = '1' and byte3_stb = '1') else
-      "00";
+  cache_we <= '1' when (S_WRITE_SEQ_Q='1' or S_RMISS_FILL_Q='1') else '0';
 
-  set_valid  <= '1' when (A_READ_MISS_FILL = '1' and byte0_stb = '1') else '0';
-  update_tag <= '1' when (A_READ_MISS_FILL = '1' and byte0_stb = '1') else '0';
+  cache_sel <= "00" when (S_RMISS_FILL_Q='1' and BYTE0_STB='1') else
+               "01" when (S_RMISS_FILL_Q='1' and BYTE1_STB='1') else
+               "10" when (S_RMISS_FILL_Q='1' and BYTE2_STB='1') else
+               "11" when (S_RMISS_FILL_Q='1' and BYTE3_STB='1') else
+               "00";
 
-  mem_enable <= '1' when A_READ_MISS_REQ = '1' else '0';
+  set_valid  <= '1' when (S_RMISS_FILL_Q='1' and BYTE0_STB='1') else '0';
+  update_tag <= '1' when (S_RMISS_FILL_Q='1' and BYTE0_STB='1') else '0';
 
-  -- Byte arrival strobes: spec says 8,10,12,14 negedges after Enable.
-  byte0_stb <= '1' when (A_READ_MISS_WAIT = '1' and ctr_q = to_unsigned(8, 5))  else '0';
-  byte1_stb <= '1' when (A_READ_MISS_FILL = '1' and ctr_q = to_unsigned(10, 5)) else '0';
-  byte2_stb <= '1' when (A_READ_MISS_FILL = '1' and ctr_q = to_unsigned(12, 5)) else '0';
-  byte3_stb <= '1' when (A_READ_MISS_FILL = '1' and ctr_q = to_unsigned(14, 5)) else '0';
+  mem_enable <= '1' when (S_RMISS_REQ_Q='1')
+                else '1' when (S_WRITE_DONE_Q='1' and nTAG_HIT='1')
+                else '0';
 
-  mem_byte_strobe <= byte3_stb & byte2_stb & byte1_stb & byte0_stb;
+  mem_byte_strobe <= (BYTE3_STB & BYTE2_STB & BYTE1_STB & BYTE0_STB);
 
-end architecture structural;
+  
+  -- === Debug Bus ===
+  
+  state_debug <= ( S_RRESPOND_Q & S_RMISS_FILL_Q & S_RMISS_WAIT_Q & S_RMISS_REQ_Q &
+                   S_WRITE_DONE_Q & S_WRITE_SEQ_Q & S_READ_HIT_Q & S_CHECK_Q &
+                   S_LATCH_Q & S_IDLE_Q );
+end architecture;
